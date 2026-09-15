@@ -2,9 +2,9 @@ name: BMVS Slot Check
 
 on:
   schedule:
-    # Every 30 minutes. GitHub's scheduler can drift a few minutes under
+    # Every 15 minutes. GitHub's scheduler can drift a few minutes under
     # load - that's normal and fine for this use case.
-    - cron: "*/30 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}   # lets you trigger a manual check from the Actions tab
 
 permissions:

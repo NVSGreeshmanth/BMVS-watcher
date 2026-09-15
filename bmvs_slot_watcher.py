@@ -101,7 +101,25 @@ TARGET_CENTRES = [
     for c in env("BMVS_TARGET_CENTRES", DEFAULT_CENTRES).split(",")
     if c.strip()
 ]
-CHECK_MINUTES = float(env("BMVS_CHECK_MINUTES", "30"))
+CHECK_MINUTES = float(env("BMVS_CHECK_MINUTES", "15"))
+
+# Send a "bot may be blocked" email after this many failed checks in a row
+# (one failure is often just a slow page, so don't alert on the first).
+FAILURE_ALERT_AFTER = int(env("BMVS_FAILURE_ALERT_AFTER", "2"))
+
+# Text that suggests we've been served a block / CAPTCHA page instead of
+# the booking site.
+BLOCK_MARKERS = (
+    "captcha",
+    "verify you are human",
+    "are you a robot",
+    "unusual traffic",
+    "access denied",
+    "request blocked",
+    "too many requests",
+    "attention required",
+    "just a moment",
+)
 
 # Centres that already show a far-out date rather than "No available slot" -
 # for these we alert on any EARLIER date appearing, not just any date.
@@ -171,11 +189,28 @@ def send_email(subject: str, body: str) -> None:
 
 
 # ------------------------------------------------------------- scraping
-async def fetch_slots(debug: bool = False) -> list[dict]:
+async def _block_reason(page, response) -> str | None:
+    """Return a description if the page looks like a block / CAPTCHA page."""
+    if response is not None and response.status in (403, 429, 503):
+        return f"HTTP {response.status} from the booking site"
+    try:
+        text = (await page.inner_text("body", timeout=5000)).lower()
+    except Exception:
+        return None
+    for marker in BLOCK_MARKERS:
+        if marker in text:
+            return f"page contains '{marker}'"
+    return None
+
+
+async def fetch_slots(debug: bool = False) -> tuple[list[dict], str | None]:
     """
-    Drives the booking flow and returns a list of rows:
-        [{"label": <first line>, "row_text": <full lowercased row text>,
-          "availability": <text>}, ...]
+    Drives the booking flow and returns (rows, problem):
+        rows    = [{"label": <first line>, "row_text": <full lowercased row text>,
+                    "availability": <text>}, ...]
+        problem = None on success, otherwise a short description of what went
+                  wrong (block page, timeout, crash) - used for the
+                  "bot may be blocked" email.
 
     We keep the full row text (not just the first column) because on this
     site the first column is sometimes the nearby town/suburb (e.g.
@@ -184,14 +219,19 @@ async def fetch_slots(debug: bool = False) -> list[dict]:
     reliable than matching against just the label.
     """
     results: list[dict] = []
+    problem: str | None = None
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=not debug)
         page = await browser.new_page()
+        response = None
 
         try:
             log.info("Opening start page...")
-            await page.goto(START_URL, wait_until="domcontentloaded", timeout=30000)
+            response = await page.goto(START_URL, wait_until="domcontentloaded", timeout=30000)
+            problem = await _block_reason(page, response)
+            if problem:
+                raise RuntimeError(problem)
 
             # SELECTOR NOTE: "New Individual booking" button on Default.aspx
             await page.click("#ContentPlaceHolder1_btnInd")
@@ -239,14 +279,60 @@ async def fetch_slots(debug: bool = False) -> list[dict]:
                     }
                 )
 
+            if not results:
+                problem = "results page loaded but no centre rows could be read"
+
         except PWTimeout:
-            log.error("Timed out waiting for a page element - site layout may have changed.")
+            problem = await _block_reason(page, None) or (
+                "timed out waiting for the booking page (site slow, layout changed, or blocked)"
+            )
+            log.error("Check failed: %s", problem)
             if debug:
                 await page.screenshot(path="debug_timeout.png", full_page=True)
+        except Exception as e:
+            problem = problem or f"unexpected error: {e}"
+            log.error("Check failed: %s", problem)
         finally:
             await browser.close()
 
-    return results
+    return results, problem
+
+
+# ------------------------------------------------------- failure alerts
+def handle_failure(state: dict, problem: str) -> None:
+    """Count consecutive failures; email once when the streak hits the threshold."""
+    fails = state.get("_consecutive_failures", 0) + 1
+    state["_consecutive_failures"] = fails
+    state["_last_problem"] = problem
+    log.warning("Failed check #%d in a row: %s", fails, problem)
+
+    if fails >= FAILURE_ALERT_AFTER and not state.get("_failure_alert_sent"):
+        send_email(
+            "BMVS watcher: check failing - bot may be blocked",
+            f"The last {fails} checks in a row failed.\n\n"
+            f"Latest problem: {problem}\n\n"
+            "This can mean the site is blocking automated checks (CAPTCHA / "
+            "rate limit), the site is down, or its layout changed.\n"
+            "Slot alerts will NOT work until this is fixed. Check the site "
+            "manually, and consider increasing the check interval.\n\n"
+            f"Time: {datetime.now().isoformat(timespec='seconds')}\n"
+            "Site: https://bmvs.onlineappointmentscheduling.net.au/oasis/Default.aspx",
+        )
+        state["_failure_alert_sent"] = True
+
+
+def handle_recovery(state: dict) -> None:
+    """Reset the failure streak; send an all-clear if we had alerted."""
+    if state.get("_failure_alert_sent"):
+        send_email(
+            "BMVS watcher: checks working again",
+            f"Checks are succeeding again after "
+            f"{state.get('_consecutive_failures', 0)} failed attempts.\n"
+            f"Last problem was: {state.get('_last_problem')}\n\n"
+            f"Time: {datetime.now().isoformat(timespec='seconds')}",
+        )
+    for key in ("_consecutive_failures", "_failure_alert_sent", "_last_problem"):
+        state.pop(key, None)
 
 
 # ------------------------------------------------------------------ main
@@ -263,13 +349,15 @@ def _parse_date(text: str):
 
 async def run_once(debug: bool = False) -> None:
     log.info("Checking BMVS availability for: %s", ", ".join(TARGET_CENTRES))
-    rows = await fetch_slots(debug=debug)
+    rows, problem = await fetch_slots(debug=debug)
+    state = load_state()
 
-    if not rows:
-        log.warning("No rows parsed - check debug screenshots / selectors.")
+    if problem:
+        handle_failure(state, problem)
+        save_state(state)
         return
 
-    state = load_state()
+    handle_recovery(state)
     changed = []
     matched_row_ids = set()
 
