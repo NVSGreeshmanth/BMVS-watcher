@@ -115,6 +115,13 @@ ALERT_TO_EMAIL = env("ALERT_TO_EMAIL", EMAIL_ADDRESS)
 
 STATE_FILE = Path(__file__).with_name("bmvs_state.json")
 
+# Windows consoles default to cp1252, which can't print some page characters
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -186,47 +193,23 @@ async def fetch_slots(debug: bool = False) -> list[dict]:
             log.info("Opening start page...")
             await page.goto(START_URL, wait_until="domcontentloaded", timeout=30000)
 
-            # SELECTOR NOTE: the start page usually has a "Make a booking" /
-            # "Book Now" style link/button. Try a few common labels.
-            for label in ["make a booking", "book now", "book an appointment", "start"]:
-                try:
-                    btn = page.get_by_role("link", name=re.compile(label, re.I))
-                    if await btn.count():
-                        await btn.first.click()
-                        break
-                    btn = page.get_by_role("button", name=re.compile(label, re.I))
-                    if await btn.count():
-                        await btn.first.click()
-                        break
-                except Exception:
-                    continue
+            # SELECTOR NOTE: "New Individual booking" button on Default.aspx
+            await page.click("#ContentPlaceHolder1_btnInd")
+            await page.wait_for_url(re.compile("Location.aspx", re.I), timeout=30000)
 
-            await page.wait_for_load_state("domcontentloaded")
-
-            # SELECTOR NOTE: postcode/suburb input field - matched by
-            # placeholder or nearby label text rather than a fixed id.
-            postcode_input = page.get_by_placeholder(re.compile("postcode|suburb|town", re.I))
-            if not await postcode_input.count():
-                # fallback: first visible text input on the page
-                postcode_input = page.locator("input[type='text']").first
-            await postcode_input.fill(POSTCODE)
+            # SELECTOR NOTE: postcode/suburb input on Location.aspx
+            await page.fill("#ContentPlaceHolder1_SelectLocation1_txtSuburb", POSTCODE)
 
             if debug:
                 await page.screenshot(path="debug_after_postcode.png")
 
-            # SELECTOR NOTE: submit / search button
-            submitted = False
-            for label in ["search", "next", "find", "go"]:
-                btn = page.get_by_role("button", name=re.compile(label, re.I))
-                if await btn.count():
-                    await btn.first.click()
-                    submitted = True
-                    break
-            if not submitted:
-                await postcode_input.press("Enter")
+            # SELECTOR NOTE: "Search" button next to the postcode field
+            await page.click("input[type='submit'][value='Search']")
 
-            # Wait for the results table to show up
-            await page.wait_for_selector("table", timeout=20000)
+            # Wait until at least one centre row (has a "NN km" distance) renders
+            await page.locator("table tr", has_text=re.compile(r"\d+ km")).first.wait_for(
+                timeout=30000
+            )
             await page.wait_for_timeout(1500)  # let JS finish rendering rows
 
             if debug:
@@ -239,14 +222,14 @@ async def fetch_slots(debug: bool = False) -> list[dict]:
                 if not row_text:
                     continue
                 # Availability is either "No available slot" or a date like
-                # "Thursday 08/10/2026 08:45 AM"
+                # "Thursday 08/10/2026\n08:45 AM" (time is on its own line)
                 m = re.search(
-                    r"(No available slot|[A-Za-z]+day \d{2}/\d{2}/\d{4}[^\n]*)",
+                    r"(No available slot|[A-Za-z]+day \d{2}/\d{2}/\d{4}(?:\s+\d{1,2}:\d{2}\s*[AP]M)?)",
                     row_text,
                 )
                 if not m:
                     continue
-                availability = m.group(1).strip()
+                availability = " ".join(m.group(1).split())
                 label = row_text.splitlines()[0].strip()
                 results.append(
                     {
@@ -319,7 +302,8 @@ async def run_once(debug: bool = False) -> None:
             # Bupa centre: already shows a date - alert only if it got earlier
             new_date = _parse_date(current)
             old_date = _parse_date(previous) if previous else None
-            if new_date and (old_date is None or new_date < old_date):
+            # first sighting just records a baseline - no email
+            if new_date and old_date and new_date < old_date:
                 changed.append((row["label"], current))
 
         state[state_key] = current
