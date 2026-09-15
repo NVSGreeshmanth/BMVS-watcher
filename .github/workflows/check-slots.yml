@@ -18,19 +18,16 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Official Playwright image: Python, Playwright and Chromium (with all
+    # system libraries) preinstalled, so each run skips the ~3 minute install.
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.62.0-noble
     steps:
+      - name: Install git
+        run: apt-get update -qq && apt-get install -y -qq git > /dev/null
+
       - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          pip install playwright
-          playwright install --with-deps chromium
+        uses: actions/checkout@v5
 
       - name: Run slot check (single pass)
         env:
@@ -41,10 +38,11 @@ jobs:
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
-        run: python bmvs_slot_watcher.py --once
+        run: python3 bmvs_slot_watcher.py --once
 
       - name: Commit updated state (if changed)
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.name "bmvs-bot"
           git config user.email "actions@users.noreply.github.com"
           if ! git diff --quiet -- bmvs_state.json; then
