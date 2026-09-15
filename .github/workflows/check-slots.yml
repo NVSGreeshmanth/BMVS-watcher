@@ -18,8 +18,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Official Playwright image: Python, Playwright and Chromium (with all
-    # system libraries) preinstalled, so each run skips the ~3 minute install.
+    # Official Playwright image: Python and Chromium (with all system
+    # libraries) preinstalled, so each run skips the ~3 minute install.
     container:
       image: mcr.microsoft.com/playwright/python:v1.62.0-noble
     steps:
@@ -28,6 +28,11 @@ jobs:
 
       - name: Checkout repo
         uses: actions/checkout@v5
+
+      - name: Install Playwright Python package
+        # image has the browsers but not the Python package; version must
+        # match the image tag so the preinstalled Chromium is used
+        run: python3 -m pip install -q --break-system-packages playwright==1.62.0
 
       - name: Run slot check (single pass)
         env:
