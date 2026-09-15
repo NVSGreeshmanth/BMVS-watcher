@@ -2,11 +2,12 @@ name: BMVS Slot Check
 
 on:
   schedule:
-    # Every 15 minutes, on odd minutes (:07, :22, :37, :52). GitHub drops or
-    # delays many jobs scheduled exactly on :00/:15/:30/:45 because that is
-    # when its scheduler is busiest.
-    - cron: "7,22,37,52 * * * *"
-  workflow_dispatch: {}   # lets you trigger a manual check from the Actions tab
+    # Hourly backup only. The main 15-minute trigger is cron-job.org calling
+    # the workflow_dispatch API, because GitHub's own scheduler is unreliable
+    # (it skipped every slot for hours after this repo was created).
+    - cron: "41 * * * *"
+  # manual "Run workflow" button, and the cron-job.org trigger
+  workflow_dispatch: {}
 
 permissions:
   contents: write   # needed so the workflow can commit the state file back
